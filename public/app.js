@@ -1,8 +1,3 @@
-// Dynamically load the resilient Tus client library directly into the frontend window context
-const script = document.createElement('script');
-script.src = "https://cdn.jsdelivr.net/npm/tus-js-client@3.0.1/dist/tus.min.js";
-document.head.appendChild(script);
-
 document.addEventListener('DOMContentLoaded', () => {
     const videoFileInput = document.getElementById('videoFile');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -11,9 +6,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const progressStatus = document.getElementById('progressStatus');
     const videoListContainer = document.getElementById('videoList');
 
+    const CHUNK_SIZE = 1024 * 1024 * 6; // Stable 6MB S3-compliant blocks
+
     fetchVideos();
 
-    uploadBtn.addEventListener('click', () => {
+    uploadBtn.addEventListener('click', async () => {
         const file = videoFileInput.files[0];
         if (!file) {
             alert('Please select a video file first!');
@@ -25,43 +22,69 @@ document.addEventListener('DOMContentLoaded', () => {
         progressContainer.style.display = 'block';
         progressBar.style.width = '0%';
         progressBar.innerText = '0%';
-        progressStatus.innerText = 'Establishing chunked resumable pipeline...';
+        progressStatus.innerText = 'Starting chunked pipeline connection...';
 
-        // Initialize a stable Tus upload stream session
-        const upload = new tus.Upload(file, {
-            endpoint: "/api/videos/upload-tus",
-            retryDelays: [0, 1000, 3000, 5000], // Auto-reconnects instantly if Render lags
-            metadata: {
-                filename: file.name,
-                filetype: file.type
-            },
-            chunkSize: 1024 * 1024 * 5, // Breaks your 4GB file into safe 5MB parts
-            onError: function (error) {
-                console.error("Failed because: " + error);
-                alert("Upload pipeline paused. Click Start Upload again to pick up where you left off.");
-                resetUploadUI();
-            },
-            onProgress: function (bytesUploaded, bytesTotal) {
-                const percentComplete = Math.round((bytesUploaded / bytesTotal) * 100);
+        try {
+            // 1. Initialize our chunked multi-part session
+            const sessionRes = await fetch('/api/videos/start-upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name })
+            });
+            if (!sessionRes.ok) throw new Error('Could not open upload session');
+            const { uploadId, b2Key } = await sessionRes.json();
+
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const uploadedParts = [];
+
+            // 2. Loop through and push each individual fragment sequential-style
+            for (let i = 0; i < totalChunks; i++) {
+                const start = i * CHUNK_SIZE;
+                const end = Math.min(start + CHUNK_SIZE, file.size);
+                const chunk = file.slice(start, end);
+                const partNumber = i + 1;
+
+                progressStatus.innerText = `Uploading movie segment ${partNumber} of ${totalChunks}...`;
+
+                const uploadPartRes = await fetch(`/api/videos/upload-part?uploadId=${uploadId}&b2Key=${b2Key}&partNumber=${partNumber}`, {
+                    method: 'POST',
+                    body: chunk
+                });
+
+                if (!uploadPartRes.ok) throw new Error(`Segment ${partNumber} connection lost`);
+                const { ETag } = await uploadPartRes.json();
+
+                uploadedParts.push({ ETag, PartNumber: partNumber });
+
+                // Smoothly increment layout bar completion metrics
+                const percentComplete = Math.round(((i + 1) / totalChunks) * 100);
                 progressBar.style.width = `${percentComplete}%`;
                 progressBar.innerText = `${percentComplete}%`;
-                
-                const uploadedGB = (bytesUploaded / (1024 * 1024 * 1024)).toFixed(2);
-                const totalGB = (bytesTotal / (1024 * 1024 * 1024)).toFixed(2);
-                progressStatus.innerText = `Chunking ${uploadedGB} GB of ${totalGB} GB safely past gateway...`;
-            },
-            onSuccess: function () {
-                progressStatus.innerText = '🎉 Video successfully shared!';
-                alert('Video successfully shared!');
-                videoFileInput.value = '';
-                // Give Postgres half a second to finish row instantiation
-                setTimeout(fetchVideos, 800);
-                resetUploadUI();
             }
-        });
 
-        // Fire the upload session
-        upload.start();
+            // 3. Command final structural link assembly
+            progressStatus.innerText = 'Assembling file layers inside bucket storage...';
+            const completeRes = await fetch('/api/videos/complete-upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uploadId, b2Key, filename: file.name, parts: uploadedParts })
+            });
+
+            if (completeRes.ok) {
+                progressStatus.innerText = '🎉 Movie successfully shared!';
+                alert('Movie successfully shared!');
+                videoFileInput.value = '';
+                fetchVideos();
+            } else {
+                throw new Error('Storage assembly processing failed');
+            }
+
+        } catch (err) {
+            console.error(err);
+            alert(`Upload Blocked: ${err.message}`);
+        } finally {
+            resetUploadUI();
+        }
     });
 
     async function fetchVideos() {

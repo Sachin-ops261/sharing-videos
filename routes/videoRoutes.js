@@ -1,15 +1,13 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
-const tus = require('tus-node-server');
-const { S3Client, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const endpointUrl = process.env.B2_ENDPOINT || '';
 const regionMatch = endpointUrl.match(/s3\.([a-z0-9\-]+)\.backblazeb2\.com/);
 const detectedRegion = regionMatch ? regionMatch[1] : 'us-east-005';
 
-// Initialize clean v3 S3 Client for downloads and deletions
 const s3Client = new S3Client({
     endpoint: `https://${endpointUrl}`,
     credentials: {
@@ -20,45 +18,77 @@ const s3Client = new S3Client({
     forcePathStyle: true
 });
 
-// FIX: Configuration parameters must be defined inside the options block directly
-const tusServer = new tus.Server({
-    path: '/api/videos/upload-tus'
-});
+// 1. START CHUNKED SESSION
+router.post('/start-upload', async (req, res) => {
+    const { filename } = req.body;
+    if (!filename) return res.status(400).json({ error: 'Filename required' });
 
-tusServer.datastore = new tus.S3Store({
-    path: '/api/videos/upload-tus',
-    bucket: process.env.B2_BUCKET_NAME,
-    accessKeyId: process.env.B2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.B2_SECRET_ACCESS_KEY,
-    endpoint: `https://${endpointUrl}`,
-    region: detectedRegion,
-    s3ForcePathStyle: true
-});
+    const uniqueKey = `${Date.now()}-${filename}`;
 
-// When a video completely finishes uploading its chunks, register it in PostgreSQL
-tusServer.on(tus.EVENTS.EVENT_UPLOAD_COMPLETE, async (event) => {
     try {
-        const filename = event.file.metadata.filename || 'shared-video.mp4';
-        const b2Key = event.file.id;
+        const command = new CreateMultipartUploadCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: uniqueKey
+        });
+        const response = await s3Client.send(command);
+
+        res.json({
+            uploadId: response.UploadId,
+            b2Key: uniqueKey
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to initialize session' });
+    }
+});
+
+// 2. RECEIVE AND PUSH SINGLE CHUNK (Keeps RAM clean)
+router.post('/upload-part', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
+    const { uploadId, b2Key, partNumber } = req.query;
+
+    try {
+        const command = new UploadPartCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: b2Key,
+            UploadId: uploadId,
+            PartNumber: parseInt(partNumber),
+            Body: req.body
+        });
+
+        const response = await s3Client.send(command);
+        res.json({ ETag: response.ETag });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Chunk transfer failed' });
+    }
+});
+
+// 3. FINAL ASSEMBLY & DATABASE INDEXING
+router.post('/complete-upload', async (req, res) => {
+    const { uploadId, b2Key, filename, parts } = req.body;
+
+    try {
+        const command = new CompleteMultipartUploadCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: b2Key,
+            UploadId: uploadId,
+            MultipartUpload: { Parts: parts }
+        });
+        await s3Client.send(command);
 
         await pool.query(
             'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
             [filename, b2Key]
         );
-        console.log(`🚀 Video successfully registered: ${filename}`);
+
+        res.json({ success: true });
     } catch (err) {
-        console.error('Failed to index complete video inside database:', err);
+        console.error(err);
+        res.status(500).json({ error: 'Final assembly failed' });
     }
 });
 
-// Pass all incoming chunk requests into the Tus protocol handler
-router.all('/upload-tus*', (req, res) => {
-    tusServer.handle(req, res);
-});
-
-/**
- * GET ROUTE: List all shared videos
- */
+// 4. GET VIDEOS LIST
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM videos ORDER BY uploaded_at DESC');
@@ -68,7 +98,6 @@ router.get('/list', async (req, res) => {
                 Key: video.b2_key
             });
             const downloadUrl = await getSignedUrl(s3Client, command, { expiresIn: 86400 });
-
             return {
                 id: video.id,
                 filename: video.filename,
@@ -78,27 +107,21 @@ router.get('/list', async (req, res) => {
         }));
         res.json(videoList);
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Failed to fetch video list' });
+        res.status(500).json({ error: 'Failed to fetch list' });
     }
 });
 
-/**
- * DELETE ROUTE
- */
+// 5. DELETE VIDEO
 router.delete('/:id', async (req, res) => {
     try {
         const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [req.params.id]);
         if (dbResult.rows.length === 0) return res.status(404).json({ error: 'Not found' });
 
-        const command = new DeleteObjectCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: dbResult.rows[0].b2_key
-        });
+        const command = new DeleteObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: dbResult.rows[0].b2_key });
         await s3Client.send(command);
 
         await pool.query('DELETE FROM videos WHERE id = $1', [req.params.id]);
-        res.json({ message: 'Deleted successfully' });
+        res.json({ message: 'Deleted' });
     } catch (err) {
         res.status(500).json({ error: 'Deletion failed' });
     }
