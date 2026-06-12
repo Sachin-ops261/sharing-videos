@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
-const { S3Client, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const endpointUrl = process.env.B2_ENDPOINT || '';
@@ -18,92 +19,45 @@ const s3Client = new S3Client({
     forcePathStyle: true
 });
 
-// 1. START CHUNKED SESSION
-router.post('/start-upload', async (req, res) => {
-    const { filename } = req.body;
-    if (!filename) return res.status(400).json({ error: 'Filename required' });
-
+router.post('/upload-stream', async (req, res) => {
+    // Read clean raw header elements
+    const rawFilename = req.headers['x-filename'] || 'video.mp4';
+    const filename = decodeURIComponent(rawFilename);
     const uniqueKey = `${Date.now()}-${filename}`;
 
     try {
-        const command = new CreateMultipartUploadCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: uniqueKey
-        });
-        const response = await s3Client.send(command);
-
-        res.json({
-            uploadId: response.UploadId,
-            b2Key: uniqueKey
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Failed to initialize session' });
-    }
-});
-
-// 2. RECEIVE AND PUSH SINGLE CHUNK (Keeps RAM clean)
-router.post('/upload-part', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
-    const { uploadId, b2Key, partNumber } = req.query;
-
-    try {
-        const command = new UploadPartCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: b2Key,
-            UploadId: uploadId,
-            PartNumber: parseInt(partNumber),
-            Body: req.body
+        const parallelUpload = new Upload({
+            client: s3Client,
+            params: {
+                Bucket: process.env.B2_BUCKET_NAME,
+                Key: uniqueKey,
+                Body: req // Pipe incoming request stream straight out to cloud bucket
+            },
+            queueSize: 4,
+            partSize: 1024 * 1024 * 10 // 10MB chunks for optimized network routing
         });
 
-        const response = await s3Client.send(command);
-        res.json({ ETag: response.ETag });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Chunk transfer failed' });
-    }
-});
-
-// 3. FINAL ASSEMBLY & DATABASE INDEXING
-router.post('/complete-upload', async (req, res) => {
-    const { uploadId, b2Key, filename, parts } = req.body;
-
-    try {
-        const command = new CompleteMultipartUploadCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: b2Key,
-            UploadId: uploadId,
-            MultipartUpload: { Parts: parts }
-        });
-        await s3Client.send(command);
+        await parallelUpload.done();
 
         await pool.query(
             'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
-            [filename, b2Key]
+            [filename, uniqueKey]
         );
 
-        res.json({ success: true });
+        res.json({ message: 'Success' });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Final assembly failed' });
+        console.error('Streaming upload failed:', err);
+        res.status(500).json({ error: 'Streaming upload failed' });
     }
 });
 
-// 4. GET VIDEOS LIST
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM videos ORDER BY uploaded_at DESC');
         const videoList = await Promise.all(result.rows.map(async (video) => {
-            const command = new GetObjectCommand({
-                Bucket: process.env.B2_BUCKET_NAME,
-                Key: video.b2_key
-            });
+            const command = new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: video.b2_key });
             const downloadUrl = await getSignedUrl(s3Client, command, { expiresIn: 86400 });
-            return {
-                id: video.id,
-                filename: video.filename,
-                downloadUrl,
-                uploadedAt: video.uploaded_at
-            };
+            return { id: video.id, filename: video.filename, downloadUrl, uploadedAt: video.uploaded_at };
         }));
         res.json(videoList);
     } catch (err) {
@@ -111,7 +65,6 @@ router.get('/list', async (req, res) => {
     }
 });
 
-// 5. DELETE VIDEO
 router.delete('/:id', async (req, res) => {
     try {
         const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [req.params.id]);

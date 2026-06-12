@@ -6,8 +6,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const progressStatus = document.getElementById('progressStatus');
     const videoListContainer = document.getElementById('videoList');
 
-    const CHUNK_SIZE = 1024 * 1024 * 6; // Stable 6MB S3-compliant blocks
-
     fetchVideos();
 
     uploadBtn.addEventListener('click', async () => {
@@ -22,67 +20,48 @@ document.addEventListener('DOMContentLoaded', () => {
         progressContainer.style.display = 'block';
         progressBar.style.width = '0%';
         progressBar.innerText = '0%';
-        progressStatus.innerText = 'Starting chunked pipeline connection...';
+        progressStatus.innerText = 'Connecting high-speed stream...';
 
         try {
-            // 1. Initialize our chunked multi-part session
-            const sessionRes = await fetch('/api/videos/start-upload', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: file.name })
-            });
-            if (!sessionRes.ok) throw new Error('Could not open upload session');
-            const { uploadId, b2Key } = await sessionRes.json();
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/videos/upload-stream', true);
+            
+            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
-            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-            const uploadedParts = [];
+            xhr.upload.onprogress = (event) => {
+                if (event.lengthComputable) {
+                    const percentComplete = Math.round((event.loaded / event.total) * 100);
+                    progressBar.style.width = `${percentComplete}%`;
+                    progressBar.innerText = `${percentComplete}%`;
+                    
+                    const uploadedGB = (event.loaded / (1024 * 1024 * 1024)).toFixed(2);
+                    const totalGB = (event.total / (1024 * 1024 * 1024)).toFixed(2);
+                    progressStatus.innerText = `Streaming ${uploadedGB} GB of ${totalGB} GB directly to bucket...`;
+                }
+            };
 
-            // 2. Loop through and push each individual fragment sequential-style
-            for (let i = 0; i < totalChunks; i++) {
-                const start = i * CHUNK_SIZE;
-                const end = Math.min(start + CHUNK_SIZE, file.size);
-                const chunk = file.slice(start, end);
-                const partNumber = i + 1;
+            xhr.onload = async () => {
+                if (xhr.status === 200) {
+                    progressStatus.innerText = '🎉 Movie successfully shared!';
+                    alert('Movie successfully shared!');
+                    videoFileInput.value = '';
+                    fetchVideos();
+                } else {
+                    alert('Upload connection reset by pipeline.');
+                }
+                resetUploadUI();
+            };
 
-                progressStatus.innerText = `Uploading movie segment ${partNumber} of ${totalChunks}...`;
+            xhr.onerror = () => {
+                alert('Network stream interrupted.');
+                resetUploadUI();
+            };
 
-                const uploadPartRes = await fetch(`/api/videos/upload-part?uploadId=${uploadId}&b2Key=${b2Key}&partNumber=${partNumber}`, {
-                    method: 'POST',
-                    body: chunk
-                });
-
-                if (!uploadPartRes.ok) throw new Error(`Segment ${partNumber} connection lost`);
-                const { ETag } = await uploadPartRes.json();
-
-                uploadedParts.push({ ETag, PartNumber: partNumber });
-
-                // Smoothly increment layout bar completion metrics
-                const percentComplete = Math.round(((i + 1) / totalChunks) * 100);
-                progressBar.style.width = `${percentComplete}%`;
-                progressBar.innerText = `${percentComplete}%`;
-            }
-
-            // 3. Command final structural link assembly
-            progressStatus.innerText = 'Assembling file layers inside bucket storage...';
-            const completeRes = await fetch('/api/videos/complete-upload', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ uploadId, b2Key, filename: file.name, parts: uploadedParts })
-            });
-
-            if (completeRes.ok) {
-                progressStatus.innerText = '🎉 Movie successfully shared!';
-                alert('Movie successfully shared!');
-                videoFileInput.value = '';
-                fetchVideos();
-            } else {
-                throw new Error('Storage assembly processing failed');
-            }
+            xhr.send(file);
 
         } catch (err) {
             console.error(err);
-            alert(`Upload Blocked: ${err.message}`);
-        } finally {
             resetUploadUI();
         }
     });
