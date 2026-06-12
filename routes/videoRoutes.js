@@ -1,87 +1,94 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
-const AWS = require('aws-sdk');
-const multer = require('multer');
-const fs = require('fs');
-
-// Use local temporary disk storage instead of system RAM
-const upload = multer({ 
-    dest: 'uploads/', // Files are safely chunked onto the hard drive temporarily
-    limits: { fileSize: 4 * 1024 * 1024 * 1024 } // 4GB maximum safety guardrail
-});
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const endpointUrl = process.env.B2_ENDPOINT || '';
 const regionMatch = endpointUrl.match(/s3\.([a-z0-9\-]+)\.backblazeb2\.com/);
 const detectedRegion = regionMatch ? regionMatch[1] : 'us-east-005';
 
-const s3 = new AWS.S3({
+// Initialize the modern S3 Client (v3)
+const s3Client = new S3Client({
     endpoint: `https://${endpointUrl}`,
-    accessKeyId: process.env.B2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.B2_SECRET_ACCESS_KEY,
+    credentials: {
+        accessKeyId: process.env.B2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.B2_SECRET_ACCESS_KEY,
+    },
     region: detectedRegion,
-    signatureVersion: 'v4',
-    s3ForcePathStyle: true
+    forcePathStyle: true
 });
 
 /**
- * 1. POST ROUTE: Receive file from frontend using disk storage streams
+ * 1. POST ROUTE: Generate a bulletproof modern presigned URL
+ * Browser requests this BEFORE sending the massive file.
  */
-router.post('/upload', upload.single('video'), async (req, res) => {
+router.post('/generate-upload-url', async (req, res) => {
+    const { filename, filetype } = req.body;
+
+    if (!filename) {
+        return res.status(400).json({ error: 'Filename is required' });
+    }
+
+    const uniqueKey = `${Date.now()}-${filename}`;
+
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded' });
-        }
-
-        const filename = req.file.originalname;
-        const uniqueKey = `${Date.now()}-${filename}`;
-        
-        // Open a direct read stream from the temp disk location
-        const fileStream = fs.createReadStream(req.file.path);
-
-        const params = {
+        const command = new PutObjectCommand({
             Bucket: process.env.B2_BUCKET_NAME,
             Key: uniqueKey,
-            Body: fileStream, // Stream raw file blocks directly to the cloud
-            ContentType: req.file.mimetype
-        };
+            ContentType: filetype || 'video/mp4'
+        });
 
-        // Complete the cloud storage sync
-        await s3.upload(params).promise();
-
-        // Automatically clean up/delete the temporary disk file right after upload finishes
-        fs.unlinkSync(req.file.path);
-
-        // Save reference track string inside Neon PostgreSQL
-        await pool.query(
-            'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
-            [filename, uniqueKey]
-        );
-
-        res.json({ message: 'Video completely processed and saved!' });
+        // Generate the upload link using the dedicated request presigner package
+        const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+        
+        res.json({
+            uploadUrl,
+            b2Key: uniqueKey
+        });
     } catch (err) {
-        console.error('Upload Error route fallback:', err);
-        // Ensure cleanup occurs even if transmission breaks down midway
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
-        res.status(500).json({ error: 'Server gateway transmission failed.' });
+        console.error('Error generating presigned URL v3:', err);
+        res.status(500).json({ error: 'Failed to generate upload link' });
     }
 });
 
 /**
- * 2. GET ROUTE: List all videos with temporary download tokens
+ * 2. POST ROUTE: Save file metadata to PostgreSQL database
+ * Browser requests this AFTER successfully finishing the direct upload to Backblaze.
+ */
+router.post('/save-metadata', async (req, res) => {
+    const { filename, b2Key } = req.body;
+
+    if (!filename || !b2Key) {
+        return res.status(400).json({ error: 'Filename and b2Key are required' });
+    }
+
+    try {
+        await pool.query(
+            'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
+            [filename, b2Key]
+        );
+        res.json({ message: 'Video metadata saved to database successfully!' });
+    } catch (err) {
+        console.error('Error saving metadata to database:', err);
+        res.status(500).json({ error: 'Database saving failed' });
+    }
+});
+
+/**
+ * 3. GET ROUTE: List all videos with download links
  */
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM videos ORDER BY uploaded_at DESC');
         
         const videoList = await Promise.all(result.rows.map(async (video) => {
-            const downloadUrl = await s3.getSignedUrlPromise('getObject', {
+            const command = new GetObjectCommand({
                 Bucket: process.env.B2_BUCKET_NAME,
-                Key: video.b2_key,
-                Expires: 86400
+                Key: video.b2_key
             });
+            
+            const downloadUrl = await getSignedUrl(s3Client, command, { expiresIn: 86400 });
 
             return {
                 id: video.id,
@@ -93,35 +100,38 @@ router.get('/list', async (req, res) => {
 
         res.json(videoList);
     } catch (err) {
-        console.error('Error fetching list:', err);
-        res.status(500).json({ error: 'Failed to build directory list' });
+        console.error('Error listing videos:', err);
+        res.status(500).json({ error: 'Failed to fetch video list' });
     }
 });
 
 /**
- * 3. DELETE ROUTE: Purge item from bucket and database tracker row
+ * 4. DELETE ROUTE: Delete from Backblaze bucket and Postgres row
  */
 router.delete('/:id', async (req, res) => {
     const videoId = req.params.id;
 
     try {
         const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [videoId]);
+        
         if (dbResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Video record not located' });
+            return res.status(404).json({ error: 'Video not found' });
         }
 
         const b2Key = dbResult.rows[0].b2_key;
 
-        await s3.deleteObject({
+        const command = new DeleteObjectCommand({
             Bucket: process.env.B2_BUCKET_NAME,
             Key: b2Key
-        }).promise();
+        });
+        await s3Client.send(command);
 
         await pool.query('DELETE FROM videos WHERE id = $1', [videoId]);
-        res.json({ message: 'Video removed to preserve capacity.' });
+
+        res.json({ message: 'Video completely deleted!' });
     } catch (err) {
-        console.error('Error deleting video context:', err);
-        res.status(500).json({ error: 'Failed to drop video entry.' });
+        console.error('Error deleting video:', err);
+        res.status(500).json({ error: 'Failed to delete video' });
     }
 });
 
