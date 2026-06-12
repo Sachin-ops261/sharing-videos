@@ -24,24 +24,24 @@ document.addEventListener('DOMContentLoaded', () => {
         progressStatus.innerText = 'Requesting direct-to-cloud authorization...';
 
         try {
-            // Step 1: Request presigned upload URL from our lightweight backend
+            // Step 1: Request a clean presigned upload URL from our backend
             const urlResponse = await fetch('/api/videos/generate-upload-url', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: file.name, filetype: file.type })
+                body: JSON.stringify({ filename: file.name })
             });
 
             if (!urlResponse.ok) throw new Error('Failed to fetch upload handshake');
             const { uploadUrl, b2Key } = await urlResponse.json();
 
-            progressStatus.innerText = 'Uploading directly to Backblaze B2 (Render load: 0%)...';
+            progressStatus.innerText = 'Uploading directly to Backblaze B2...';
 
-            // Step 2: Push file straight to Backblaze using XMLHttpRequest to monitor progress
+            // Step 2: Push the file straight to Backblaze using XMLHttpRequest to monitor progress
             const xhr = new XMLHttpRequest();
             xhr.open('PUT', uploadUrl, true);
             
-            // Crucial: Pass the exact same ContentType used to sign the command
-            xhr.setRequestHeader('Content-Type', file.type || 'video/mp4');
+            // NOTE: We intentionally do NOT set an explicit Content-Type request header here.
+            // This prevents browser preflight configuration conflicts with the Backblaze S3 API.
 
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
@@ -56,11 +56,10 @@ document.addEventListener('DOMContentLoaded', () => {
             };
 
             xhr.onload = async () => {
-                // S3 APIs respond with HTTP 200 on successful PUT uploads
-                if (xhr.status === 200) {
+                if (xhr.status === 200 || xhr.status === 201) {
                     progressStatus.innerText = 'Finalizing metadata registration...';
 
-                    // Step 3: Tell our database to keep track of this new file key
+                    // Step 3: Tell our database to index this new file reference key
                     const metaResponse = await fetch('/api/videos/save-metadata', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -68,7 +67,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
 
                     if (metaResponse.ok) {
-                        progressStatus.innerText = '🎉 File uploaded directly to Cloud!';
+                        progressStatus.innerText = '🎉 Video successfully shared!';
                         alert('Video successfully shared!');
                         videoFileInput.value = '';
                         fetchVideos();
@@ -76,7 +75,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         throw new Error('Cloud upload verified but database indexing rejected.');
                     }
                 } else {
-                    throw new Error('Cloud bucket rejected binary stream headers.');
+                    throw new Error(`Cloud bucket rejected binary stream with code: ${xhr.status}`);
                 }
                 resetUploadUI();
             };

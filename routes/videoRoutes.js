@@ -8,7 +8,6 @@ const endpointUrl = process.env.B2_ENDPOINT || '';
 const regionMatch = endpointUrl.match(/s3\.([a-z0-9\-]+)\.backblazeb2\.com/);
 const detectedRegion = regionMatch ? regionMatch[1] : 'us-east-005';
 
-// Initialize the modern S3 Client (v3)
 const s3Client = new S3Client({
     endpoint: `https://${endpointUrl}`,
     credentials: {
@@ -20,11 +19,10 @@ const s3Client = new S3Client({
 });
 
 /**
- * 1. POST ROUTE: Generate a bulletproof modern presigned URL
- * Browser requests this BEFORE sending the massive file.
+ * 1. POST ROUTE: Generate a clean presigned URL without pinning Content-Type headers
  */
 router.post('/generate-upload-url', async (req, res) => {
-    const { filename, filetype } = req.body;
+    const { filename } = req.body;
 
     if (!filename) {
         return res.status(400).json({ error: 'Filename is required' });
@@ -35,11 +33,11 @@ router.post('/generate-upload-url', async (req, res) => {
     try {
         const command = new PutObjectCommand({
             Bucket: process.env.B2_BUCKET_NAME,
-            Key: uniqueKey,
-            ContentType: filetype || 'video/mp4'
+            Key: uniqueKey
+            // We intentionally leave ContentType out of the signing payload here
+            // to stop Backblaze from throwing signature/CORS mismatches on preflight
         });
 
-        // Generate the upload link using the dedicated request presigner package
         const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
         
         res.json({
@@ -47,14 +45,13 @@ router.post('/generate-upload-url', async (req, res) => {
             b2Key: uniqueKey
         });
     } catch (err) {
-        console.error('Error generating presigned URL v3:', err);
+        console.error('Error generating presigned URL:', err);
         res.status(500).json({ error: 'Failed to generate upload link' });
     }
 });
 
 /**
- * 2. POST ROUTE: Save file metadata to PostgreSQL database
- * Browser requests this AFTER successfully finishing the direct upload to Backblaze.
+ * 2. POST ROUTE: Save file metadata to PostgreSQL
  */
 router.post('/save-metadata', async (req, res) => {
     const { filename, b2Key } = req.body;
@@ -68,15 +65,15 @@ router.post('/save-metadata', async (req, res) => {
             'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
             [filename, b2Key]
         );
-        res.json({ message: 'Video metadata saved to database successfully!' });
+        res.json({ message: 'Video metadata saved successfully!' });
     } catch (err) {
-        console.error('Error saving metadata to database:', err);
+        console.error('Error saving metadata:', err);
         res.status(500).json({ error: 'Database saving failed' });
     }
 });
 
 /**
- * 3. GET ROUTE: List all videos with download links
+ * 3. GET ROUTE: List all videos
  */
 router.get('/list', async (req, res) => {
     try {
@@ -106,14 +103,13 @@ router.get('/list', async (req, res) => {
 });
 
 /**
- * 4. DELETE ROUTE: Delete from Backblaze bucket and Postgres row
+ * 4. DELETE ROUTE: Delete video
  */
 router.delete('/:id', async (req, res) => {
     const videoId = req.params.id;
 
     try {
         const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [videoId]);
-        
         if (dbResult.rows.length === 0) {
             return res.status(404).json({ error: 'Video not found' });
         }
@@ -127,7 +123,6 @@ router.delete('/:id', async (req, res) => {
         await s3Client.send(command);
 
         await pool.query('DELETE FROM videos WHERE id = $1', [videoId]);
-
         res.json({ message: 'Video completely deleted!' });
     } catch (err) {
         console.error('Error deleting video:', err);
