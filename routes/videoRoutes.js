@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
-const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const endpointUrl = process.env.B2_ENDPOINT || '';
@@ -19,61 +20,46 @@ const s3Client = new S3Client({
 });
 
 /**
- * 1. POST ROUTE: Generate a clean presigned URL without pinning Content-Type headers
+ * STREAM UPLOAD ROUTE: Receives data from browser and instantly pipes it to Backblaze
  */
-router.post('/generate-upload-url', async (req, res) => {
-    const { filename } = req.body;
-
+router.post('/upload-stream', async (req, res) => {
+    const filename = req.headers['x-filename'];
     if (!filename) {
-        return res.status(400).json({ error: 'Filename is required' });
+        return res.status(400).json({ error: 'Missing X-Filename header' });
     }
 
     const uniqueKey = `${Date.now()}-${filename}`;
 
     try {
-        const command = new PutObjectCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: uniqueKey
-            // We intentionally leave ContentType out of the signing payload here
-            // to stop Backblaze from throwing signature/CORS mismatches on preflight
+        // Automatically manages multi-part chunk streams without eating RAM or Disk space
+        const parallelUpload = new Upload({
+            client: s3Client,
+            params: {
+                Bucket: process.env.B2_BUCKET_NAME,
+                Key: uniqueKey,
+                Body: req // The raw incoming request stream
+            },
+            queueSize: 4,
+            partSize: 1024 * 1024 * 5 // 5MB chunks
         });
 
-        const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
-        
-        res.json({
-            uploadUrl,
-            b2Key: uniqueKey
-        });
-    } catch (err) {
-        console.error('Error generating presigned URL:', err);
-        res.status(500).json({ error: 'Failed to generate upload link' });
-    }
-});
+        await parallelUpload.done();
 
-/**
- * 2. POST ROUTE: Save file metadata to PostgreSQL
- */
-router.post('/save-metadata', async (req, res) => {
-    const { filename, b2Key } = req.body;
-
-    if (!filename || !b2Key) {
-        return res.status(400).json({ error: 'Filename and b2Key are required' });
-    }
-
-    try {
+        // Save reference info directly to Postgres
         await pool.query(
             'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
-            [filename, b2Key]
+            [filename, uniqueKey]
         );
-        res.json({ message: 'Video metadata saved successfully!' });
+
+        res.json({ message: 'Video uploaded and saved successfully!' });
     } catch (err) {
-        console.error('Error saving metadata:', err);
-        res.status(500).json({ error: 'Database saving failed' });
+        console.error('Streaming upload failed:', err);
+        res.status(500).json({ error: 'Streaming upload failed' });
     }
 });
 
 /**
- * 3. GET ROUTE: List all videos
+ * GET ROUTE: List all videos with secure download URLs
  */
 router.get('/list', async (req, res) => {
     try {
@@ -84,7 +70,6 @@ router.get('/list', async (req, res) => {
                 Bucket: process.env.B2_BUCKET_NAME,
                 Key: video.b2_key
             });
-            
             const downloadUrl = await getSignedUrl(s3Client, command, { expiresIn: 86400 });
 
             return {
@@ -103,30 +88,23 @@ router.get('/list', async (req, res) => {
 });
 
 /**
- * 4. DELETE ROUTE: Delete video
+ * DELETE ROUTE
  */
 router.delete('/:id', async (req, res) => {
-    const videoId = req.params.id;
-
     try {
-        const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [videoId]);
-        if (dbResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Video not found' });
-        }
-
-        const b2Key = dbResult.rows[0].b2_key;
+        const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [req.params.id]);
+        if (dbResult.rows.length === 0) return res.status(404).json({ error: 'Not found' });
 
         const command = new DeleteObjectCommand({
             Bucket: process.env.B2_BUCKET_NAME,
-            Key: b2Key
+            Key: dbResult.rows[0].b2_key
         });
         await s3Client.send(command);
 
-        await pool.query('DELETE FROM videos WHERE id = $1', [videoId]);
-        res.json({ message: 'Video completely deleted!' });
+        await pool.query('DELETE FROM videos WHERE id = $1', [req.params.id]);
+        res.json({ message: 'Deleted successfully' });
     } catch (err) {
-        console.error('Error deleting video:', err);
-        res.status(500).json({ error: 'Failed to delete video' });
+        res.status(500).json({ error: 'Deletion failed' });
     }
 });
 

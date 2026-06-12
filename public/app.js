@@ -10,7 +10,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     uploadBtn.addEventListener('click', async () => {
         const file = videoFileInput.files[0];
-        
         if (!file) {
             alert('Please select a video file first!');
             return;
@@ -21,27 +20,15 @@ document.addEventListener('DOMContentLoaded', () => {
         progressContainer.style.display = 'block';
         progressBar.style.width = '0%';
         progressBar.innerText = '0%';
-        progressStatus.innerText = 'Requesting direct-to-cloud authorization...';
+        progressStatus.innerText = 'Initializing memory streaming pipeline...';
 
         try {
-            // Step 1: Request a clean presigned upload URL from our backend
-            const urlResponse = await fetch('/api/videos/generate-upload-url', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filename: file.name })
-            });
-
-            if (!urlResponse.ok) throw new Error('Failed to fetch upload handshake');
-            const { uploadUrl, b2Key } = await urlResponse.json();
-
-            progressStatus.innerText = 'Uploading directly to Backblaze B2...';
-
-            // Step 2: Push the file straight to Backblaze using XMLHttpRequest to monitor progress
             const xhr = new XMLHttpRequest();
-            xhr.open('PUT', uploadUrl, true);
+            xhr.open('POST', '/api/videos/upload-stream', true);
             
-            // NOTE: We intentionally do NOT set an explicit Content-Type request header here.
-            // This prevents browser preflight configuration conflicts with the Backblaze S3 API.
+            // Pass the metadata inside safe custom header text strings
+            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
@@ -51,37 +38,24 @@ document.addEventListener('DOMContentLoaded', () => {
                     
                     const uploadedGB = (event.loaded / (1024 * 1024 * 1024)).toFixed(2);
                     const totalGB = (event.total / (1024 * 1024 * 1024)).toFixed(2);
-                    progressStatus.innerText = `Uploaded ${uploadedGB} GB of ${totalGB} GB directly to cloud storage...`;
+                    progressStatus.innerText = `Streaming ${uploadedGB} GB of ${totalGB} GB directly to bucket...`;
                 }
             };
 
             xhr.onload = async () => {
-                if (xhr.status === 200 || xhr.status === 201) {
-                    progressStatus.innerText = 'Finalizing metadata registration...';
-
-                    // Step 3: Tell our database to index this new file reference key
-                    const metaResponse = await fetch('/api/videos/save-metadata', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ filename: file.name, b2Key })
-                    });
-
-                    if (metaResponse.ok) {
-                        progressStatus.innerText = '🎉 Video successfully shared!';
-                        alert('Video successfully shared!');
-                        videoFileInput.value = '';
-                        fetchVideos();
-                    } else {
-                        throw new Error('Cloud upload verified but database indexing rejected.');
-                    }
+                if (xhr.status === 200) {
+                    progressStatus.innerText = '🎉 Video successfully shared!';
+                    alert('Video successfully shared!');
+                    videoFileInput.value = '';
+                    fetchVideos();
                 } else {
-                    throw new Error(`Cloud bucket rejected binary stream with code: ${xhr.status}`);
+                    alert('Upload rejected by streaming pipeline.');
                 }
                 resetUploadUI();
             };
 
             xhr.onerror = () => {
-                alert('A direct network interruption occurred.');
+                alert('Network stream interrupted.');
                 resetUploadUI();
             };
 
@@ -89,7 +63,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (err) {
             console.error(err);
-            alert(`Upload Pipeline Blocked: ${err.message}`);
+            alert(`Stream Error: ${err.message}`);
             resetUploadUI();
         }
     });
@@ -98,14 +72,11 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const response = await fetch('/api/videos/list');
             const videos = await response.json();
-
             if (videos.length === 0) {
                 videoListContainer.innerHTML = '<p class="loading-text">No shared videos available right now.</p>';
                 return;
             }
-
             videoListContainer.innerHTML = '';
-
             videos.forEach(video => {
                 const formattedDate = new Date(video.uploadedAt).toLocaleString();
                 const videoItem = document.createElement('div');
@@ -125,27 +96,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
             document.querySelectorAll('.delete-btn').forEach(btn => {
                 btn.addEventListener('click', async (e) => {
-                    const id = e.target.getAttribute('data-id');
-                    if (confirm('Are you sure you want to delete this video?')) {
-                        await deleteVideo(id);
+                    if (confirm('Are you sure?')) {
+                        await fetch(`/api/videos/${e.target.getAttribute('data-id')}`, { method: 'DELETE' });
+                        fetchVideos();
                     }
                 });
             });
-
-        } catch (err) {
-            console.error(err);
-            videoListContainer.innerHTML = '<p class="loading-text" style="color: #e11d48;">Error listing records.</p>';
-        }
-    }
-
-    async function deleteVideo(id) {
-        try {
-            const response = await fetch(`/api/videos/${id}`, { method: 'DELETE' });
-            if (response.ok) {
-                fetchVideos();
-            } else {
-                alert('Failed to delete video.');
-            }
         } catch (err) {
             console.error(err);
         }
@@ -154,8 +110,6 @@ document.addEventListener('DOMContentLoaded', () => {
     function resetUploadUI() {
         uploadBtn.disabled = false;
         videoFileInput.disabled = false;
-        setTimeout(() => {
-            progressContainer.style.display = 'none';
-        }, 5000);
+        setTimeout(() => { progressContainer.style.display = 'none'; }, 5000);
     }
 });
