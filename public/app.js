@@ -20,14 +20,23 @@ document.addEventListener('DOMContentLoaded', () => {
         progressContainer.style.display = 'block';
         progressBar.style.width = '0%';
         progressBar.innerText = '0%';
-        progressStatus.innerText = 'Connecting high-speed stream...';
+        progressStatus.innerText = 'Requesting direct storage upload pass...';
 
         try {
+            // 1. Fetch direct cloud authorization URL from Render
+            const tokenRes = await fetch('/api/videos/get-presigned-url', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: file.name, contentType: file.type })
+            });
+
+            if (!tokenRes.ok) throw new Error('Render rejected upload ticket generation');
+            const { uploadUrl, b2Key } = await tokenRes.json();
+
+            // 2. Upload file DIRECTLY to Backblaze storage bypasses Render gateway completely
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/videos/upload-stream', true);
-            
-            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
-            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+            xhr.open('PUT', uploadUrl, true);
+            xhr.setRequestHeader('Content-Type', file.type);
 
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
@@ -37,24 +46,37 @@ document.addEventListener('DOMContentLoaded', () => {
                     
                     const uploadedGB = (event.loaded / (1024 * 1024 * 1024)).toFixed(2);
                     const totalGB = (event.total / (1024 * 1024 * 1024)).toFixed(2);
-                    progressStatus.innerText = `Streaming ${uploadedGB} GB of ${totalGB} GB directly to bucket...`;
+                    progressStatus.innerText = `Uploading directly to Backblaze: ${uploadedGB} GB of ${totalGB} GB...`;
                 }
             };
 
             xhr.onload = async () => {
                 if (xhr.status === 200) {
-                    progressStatus.innerText = '🎉 Movie successfully shared!';
-                    alert('Movie successfully shared!');
-                    videoFileInput.value = '';
-                    fetchVideos();
+                    progressStatus.innerText = 'Saving video entry to database...';
+                    
+                    // 3. Notify Render that the file is safe in Backblaze
+                    const registerRes = await fetch('/api/videos/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ filename: file.name, b2Key })
+                    });
+
+                    if (registerRes.ok) {
+                        progressStatus.innerText = '🎉 Movie successfully shared!';
+                        alert('Movie successfully shared!');
+                        videoFileInput.value = '';
+                        fetchVideos();
+                    } else {
+                        alert('Failed to register upload with database.');
+                    }
                 } else {
-                    alert('Upload connection reset by pipeline.');
+                    alert(`Cloud storage rejected transfer with status code: ${xhr.status}`);
                 }
                 resetUploadUI();
             };
 
             xhr.onerror = () => {
-                alert('Network stream interrupted.');
+                alert('Direct cloud connection failed.');
                 resetUploadUI();
             };
 
@@ -62,6 +84,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (err) {
             console.error(err);
+            alert(`Setup error: ${err.message}`);
             resetUploadUI();
         }
     });

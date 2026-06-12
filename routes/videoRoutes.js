@@ -1,8 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
-const { S3Client, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const { Upload } = require('@aws-sdk/lib-storage');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const endpointUrl = process.env.B2_ENDPOINT || '';
@@ -19,38 +18,52 @@ const s3Client = new S3Client({
     forcePathStyle: true
 });
 
-router.post('/upload-stream', async (req, res) => {
-    // Read clean raw header elements
-    const rawFilename = req.headers['x-filename'] || 'video.mp4';
-    const filename = decodeURIComponent(rawFilename);
+/**
+ * 1. GENERATE DIRECT UPLOAD URL
+ */
+router.post('/get-presigned-url', async (req, res) => {
+    const { filename, contentType } = req.body;
+    if (!filename) return res.status(400).json({ error: 'Filename is required' });
+
     const uniqueKey = `${Date.now()}-${filename}`;
 
     try {
-        const parallelUpload = new Upload({
-            client: s3Client,
-            params: {
-                Bucket: process.env.B2_BUCKET_NAME,
-                Key: uniqueKey,
-                Body: req // Pipe incoming request stream straight out to cloud bucket
-            },
-            queueSize: 4,
-            partSize: 1024 * 1024 * 10 // 10MB chunks for optimized network routing
+        const command = new PutObjectCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: uniqueKey,
+            ContentType: contentType || 'application/octet-stream'
         });
 
-        await parallelUpload.done();
+        // Generate a direct link to Backblaze valid for 30 minutes
+        const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 1800 });
 
-        await pool.query(
-            'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
-            [filename, uniqueKey]
-        );
-
-        res.json({ message: 'Success' });
+        res.json({ uploadUrl, b2Key: uniqueKey });
     } catch (err) {
-        console.error('Streaming upload failed:', err);
-        res.status(500).json({ error: 'Streaming upload failed' });
+        console.error(err);
+        res.status(500).json({ error: 'Failed to generate upload tokens' });
     }
 });
 
+/**
+ * 2. SAVE SUCCESSFUL UPLOAD METADATA TO DATABASE
+ */
+router.post('/register', async (req, res) => {
+    const { filename, b2Key } = req.body;
+    try {
+        await pool.query(
+            'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
+            [filename, b2Key]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to index file in database' });
+    }
+});
+
+/**
+ * 3. LIST VIDEOS
+ */
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM videos ORDER BY uploaded_at DESC');
@@ -65,6 +78,9 @@ router.get('/list', async (req, res) => {
     }
 });
 
+/**
+ * 4. DELETE VIDEO
+ */
 router.delete('/:id', async (req, res) => {
     try {
         const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [req.params.id]);
