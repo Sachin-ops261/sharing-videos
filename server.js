@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
-const { S3Client, ListObjectsV2Command } = require('@aws-sdk/client-s3');
+const { S3Client, ListObjectsV2Command, PutBucketCorsCommand } = require('@aws-sdk/client-s3');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,7 +18,7 @@ const endpointUrl = process.env.B2_ENDPOINT || '';
 const regionMatch = endpointUrl.match(/s3\.([a-z0-9\-]+)\.backblazeb2\.com/);
 const detectedRegion = regionMatch ? regionMatch[1] : 'us-east-005';
 
-// Initialize the modern v3 S3 Client for the startup sanity check
+// Initialize the modern v3 S3 Client
 const s3Client = new S3Client({
     endpoint: `https://${endpointUrl}`,
     credentials: {
@@ -29,20 +29,41 @@ const s3Client = new S3Client({
     forcePathStyle: true
 });
 
-// Run a quick connection test on boot
-async function testCloudConnection() {
+// AUTOMATED CURE: Programmatically force Backblaze to update its CORS rules
+async function configureBucketCors() {
     try {
-        const command = new ListObjectsV2Command({
+        console.log('⏳ Attempting to inject bulletproof CORS rules into Backblaze...');
+        
+        const corsCommand = new PutBucketCorsCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            CORSConfiguration: {
+                CORSRules: [
+                    {
+                        AllowedOrigins: ['*'], // Allows your local machine AND your Render live domain
+                        AllowedMethods: ['PUT', 'POST', 'GET', 'HEAD', 'DELETE'],
+                        AllowedHeaders: ['*'],
+                        ExposeHeaders: ['ETag', 'x-amz-server-side-encryption', 'x-amz-request-id'],
+                        MaxAgeSeconds: 3600
+                    }
+                ]
+            }
+        });
+
+        await s3Client.send(corsCommand);
+        console.log('🚀 ✅ SUCCESS: Backblaze CORS rules have been hard-coded into your bucket!');
+
+        // Sanity connection check
+        const listCommand = new ListObjectsV2Command({
             Bucket: process.env.B2_BUCKET_NAME,
             MaxKeys: 1
         });
-        await s3Client.send(command);
-        console.log('✅ Successfully connected to Backblaze B2 Cloud Storage via SDK v3!');
+        await s3Client.send(listCommand);
+        console.log('✅ Connected to Backblaze storage successfully.');
     } catch (err) {
-        console.error('❌ Error connecting to Backblaze B2:', err.message);
+        console.error('❌ Failed to auto-configure Backblaze CORS:', err.message);
     }
 }
-testCloudConnection();
+configureBucketCors();
 
 app.get('/api/health', (req, res) => {
     res.json({ message: "Server running smoothly!" });
