@@ -20,8 +20,11 @@ const s3Client = new S3Client({
     forcePathStyle: true
 });
 
-// Configure the Tus server to stream chunks smoothly to Backblaze
-const tusServer = new tus.Server();
+// FIX: Configuration parameters must be defined inside the options block directly
+const tusServer = new tus.Server({
+    path: '/api/videos/upload-tus'
+});
+
 tusServer.datastore = new tus.S3Store({
     path: '/api/videos/upload-tus',
     bucket: process.env.B2_BUCKET_NAME,
