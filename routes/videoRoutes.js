@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
-const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, CreateMultipartUploadCommand, UploadPartCommand, CompleteMultipartUploadCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const endpointUrl = process.env.B2_ENDPOINT || '';
@@ -18,52 +18,63 @@ const s3Client = new S3Client({
     forcePathStyle: true
 });
 
-/**
- * 1. GENERATE DIRECT UPLOAD URL
- */
-router.post('/get-presigned-url', async (req, res) => {
-    const { filename, contentType } = req.body;
-    if (!filename) return res.status(400).json({ error: 'Filename is required' });
-
+// 1. START SESSION
+router.post('/start-upload', async (req, res) => {
+    const { filename } = req.body;
+    if (!filename) return res.status(400).json({ error: 'Filename required' });
     const uniqueKey = `${Date.now()}-${filename}`;
 
     try {
-        const command = new PutObjectCommand({
-            Bucket: process.env.B2_BUCKET_NAME,
-            Key: uniqueKey,
-            ContentType: contentType || 'application/octet-stream'
-        });
-
-        // Generate a direct link to Backblaze valid for 30 minutes
-        const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 1800 });
-
-        res.json({ uploadUrl, b2Key: uniqueKey });
+        const command = new CreateMultipartUploadCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: uniqueKey });
+        const response = await s3Client.send(command);
+        res.json({ uploadId: response.UploadId, b2Key: uniqueKey });
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Failed to generate upload tokens' });
+        res.status(500).json({ error: 'Session failed' });
     }
 });
 
-/**
- * 2. SAVE SUCCESSFUL UPLOAD METADATA TO DATABASE
- */
-router.post('/register', async (req, res) => {
-    const { filename, b2Key } = req.body;
+// 2. RECEIVE 40MB CHUNK (No CORS issues, fits perfectly in Render memory)
+router.post('/upload-part', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+    const { uploadId, b2Key, partNumber } = req.query;
+
     try {
-        await pool.query(
-            'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
-            [filename, b2Key]
-        );
+        const command = new UploadPartCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: b2Key,
+            UploadId: uploadId,
+            PartNumber: parseInt(partNumber),
+            Body: req.body
+        });
+        const response = await s3Client.send(command);
+        res.json({ ETag: response.ETag });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Chunk push failed' });
+    }
+});
+
+// 3. COMPLETE ASSEMBLY
+router.post('/complete-upload', async (req, res) => {
+    const { uploadId, b2Key, filename, parts } = req.body;
+    try {
+        const command = new CompleteMultipartUploadCommand({
+            Bucket: process.env.B2_BUCKET_NAME,
+            Key: b2Key,
+            UploadId: uploadId,
+            MultipartUpload: { Parts: parts }
+        });
+        await s3Client.send(command);
+
+        await pool.query('INSERT INTO videos (filename, b2_key) VALUES ($1, $2)', [filename, b2Key]);
         res.json({ success: true });
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Failed to index file in database' });
+        res.status(500).json({ error: 'Assembly failed' });
     }
 });
 
-/**
- * 3. LIST VIDEOS
- */
+// LIST VIDEOS
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM videos ORDER BY uploaded_at DESC');
@@ -73,27 +84,19 @@ router.get('/list', async (req, res) => {
             return { id: video.id, filename: video.filename, downloadUrl, uploadedAt: video.uploaded_at };
         }));
         res.json(videoList);
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch list' });
-    }
+    } catch (err) { res.status(500).json({ error: 'Fetch failed' }); }
 });
 
-/**
- * 4. DELETE VIDEO
- */
+// DELETE VIDEO
 router.delete('/:id', async (req, res) => {
     try {
         const dbResult = await pool.query('SELECT b2_key FROM videos WHERE id = $1', [req.params.id]);
         if (dbResult.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-
         const command = new DeleteObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: dbResult.rows[0].b2_key });
         await s3Client.send(command);
-
         await pool.query('DELETE FROM videos WHERE id = $1', [req.params.id]);
         res.json({ message: 'Deleted' });
-    } catch (err) {
-        res.status(500).json({ error: 'Deletion failed' });
-    }
+    } catch (err) { res.status(500).json({ error: 'Delete failed' }); }
 });
 
 module.exports = router;
