@@ -1,14 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
+const tus = require('tus-node-server');
 const { S3Client, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const { Upload } = require('@aws-sdk/lib-storage');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const endpointUrl = process.env.B2_ENDPOINT || '';
 const regionMatch = endpointUrl.match(/s3\.([a-z0-9\-]+)\.backblazeb2\.com/);
 const detectedRegion = regionMatch ? regionMatch[1] : 'us-east-005';
 
+// Initialize clean v3 S3 Client for downloads and deletions
 const s3Client = new S3Client({
     endpoint: `https://${endpointUrl}`,
     credentials: {
@@ -19,52 +20,45 @@ const s3Client = new S3Client({
     forcePathStyle: true
 });
 
-/**
- * STREAM UPLOAD ROUTE: Receives data from browser and instantly pipes it to Backblaze
- */
-router.post('/upload-stream', async (req, res) => {
-    const filename = req.headers['x-filename'];
-    if (!filename) {
-        return res.status(400).json({ error: 'Missing X-Filename header' });
-    }
+// Configure the Tus server to stream chunks smoothly to Backblaze
+const tusServer = new tus.Server();
+tusServer.datastore = new tus.S3Store({
+    path: '/api/videos/upload-tus',
+    bucket: process.env.B2_BUCKET_NAME,
+    accessKeyId: process.env.B2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.B2_SECRET_ACCESS_KEY,
+    endpoint: `https://${endpointUrl}`,
+    region: detectedRegion,
+    s3ForcePathStyle: true
+});
 
-    const uniqueKey = `${Date.now()}-${filename}`;
-
+// When a video completely finishes uploading its chunks, register it in PostgreSQL
+tusServer.on(tus.EVENTS.EVENT_UPLOAD_COMPLETE, async (event) => {
     try {
-        // Automatically manages multi-part chunk streams without eating RAM or Disk space
-        const parallelUpload = new Upload({
-            client: s3Client,
-            params: {
-                Bucket: process.env.B2_BUCKET_NAME,
-                Key: uniqueKey,
-                Body: req // The raw incoming request stream
-            },
-            queueSize: 4,
-            partSize: 1024 * 1024 * 5 // 5MB chunks
-        });
+        const filename = event.file.metadata.filename || 'shared-video.mp4';
+        const b2Key = event.file.id;
 
-        await parallelUpload.done();
-
-        // Save reference info directly to Postgres
         await pool.query(
             'INSERT INTO videos (filename, b2_key) VALUES ($1, $2)',
-            [filename, uniqueKey]
+            [filename, b2Key]
         );
-
-        res.json({ message: 'Video uploaded and saved successfully!' });
+        console.log(`🚀 Video successfully registered: ${filename}`);
     } catch (err) {
-        console.error('Streaming upload failed:', err);
-        res.status(500).json({ error: 'Streaming upload failed' });
+        console.error('Failed to index complete video inside database:', err);
     }
 });
 
+// Pass all incoming chunk requests into the Tus protocol handler
+router.all('/upload-tus*', (req, res) => {
+    tusServer.handle(req, res);
+});
+
 /**
- * GET ROUTE: List all videos with secure download URLs
+ * GET ROUTE: List all shared videos
  */
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM videos ORDER BY uploaded_at DESC');
-        
         const videoList = await Promise.all(result.rows.map(async (video) => {
             const command = new GetObjectCommand({
                 Bucket: process.env.B2_BUCKET_NAME,
@@ -79,10 +73,9 @@ router.get('/list', async (req, res) => {
                 uploadedAt: video.uploaded_at
             };
         }));
-
         res.json(videoList);
     } catch (err) {
-        console.error('Error listing videos:', err);
+        console.error(err);
         res.status(500).json({ error: 'Failed to fetch video list' });
     }
 });

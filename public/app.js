@@ -1,3 +1,8 @@
+// Dynamically load the resilient Tus client library directly into the frontend window context
+const script = document.createElement('script');
+script.src = "https://cdn.jsdelivr.net/npm/tus-js-client@3.0.1/dist/tus.min.js";
+document.head.appendChild(script);
+
 document.addEventListener('DOMContentLoaded', () => {
     const videoFileInput = document.getElementById('videoFile');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -8,7 +13,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     fetchVideos();
 
-    uploadBtn.addEventListener('click', async () => {
+    uploadBtn.addEventListener('click', () => {
         const file = videoFileInput.files[0];
         if (!file) {
             alert('Please select a video file first!');
@@ -20,52 +25,43 @@ document.addEventListener('DOMContentLoaded', () => {
         progressContainer.style.display = 'block';
         progressBar.style.width = '0%';
         progressBar.innerText = '0%';
-        progressStatus.innerText = 'Initializing memory streaming pipeline...';
+        progressStatus.innerText = 'Establishing chunked resumable pipeline...';
 
-        try {
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/videos/upload-stream', true);
-            
-            // Pass the metadata inside safe custom header text strings
-            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
-            xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-
-            xhr.upload.onprogress = (event) => {
-                if (event.lengthComputable) {
-                    const percentComplete = Math.round((event.loaded / event.total) * 100);
-                    progressBar.style.width = `${percentComplete}%`;
-                    progressBar.innerText = `${percentComplete}%`;
-                    
-                    const uploadedGB = (event.loaded / (1024 * 1024 * 1024)).toFixed(2);
-                    const totalGB = (event.total / (1024 * 1024 * 1024)).toFixed(2);
-                    progressStatus.innerText = `Streaming ${uploadedGB} GB of ${totalGB} GB directly to bucket...`;
-                }
-            };
-
-            xhr.onload = async () => {
-                if (xhr.status === 200) {
-                    progressStatus.innerText = '🎉 Video successfully shared!';
-                    alert('Video successfully shared!');
-                    videoFileInput.value = '';
-                    fetchVideos();
-                } else {
-                    alert('Upload rejected by streaming pipeline.');
-                }
+        // Initialize a stable Tus upload stream session
+        const upload = new tus.Upload(file, {
+            endpoint: "/api/videos/upload-tus",
+            retryDelays: [0, 1000, 3000, 5000], // Auto-reconnects instantly if Render lags
+            metadata: {
+                filename: file.name,
+                filetype: file.type
+            },
+            chunkSize: 1024 * 1024 * 5, // Breaks your 4GB file into safe 5MB parts
+            onError: function (error) {
+                console.error("Failed because: " + error);
+                alert("Upload pipeline paused. Click Start Upload again to pick up where you left off.");
                 resetUploadUI();
-            };
-
-            xhr.onerror = () => {
-                alert('Network stream interrupted.');
+            },
+            onProgress: function (bytesUploaded, bytesTotal) {
+                const percentComplete = Math.round((bytesUploaded / bytesTotal) * 100);
+                progressBar.style.width = `${percentComplete}%`;
+                progressBar.innerText = `${percentComplete}%`;
+                
+                const uploadedGB = (bytesUploaded / (1024 * 1024 * 1024)).toFixed(2);
+                const totalGB = (bytesTotal / (1024 * 1024 * 1024)).toFixed(2);
+                progressStatus.innerText = `Chunking ${uploadedGB} GB of ${totalGB} GB safely past gateway...`;
+            },
+            onSuccess: function () {
+                progressStatus.innerText = '🎉 Video successfully shared!';
+                alert('Video successfully shared!');
+                videoFileInput.value = '';
+                // Give Postgres half a second to finish row instantiation
+                setTimeout(fetchVideos, 800);
                 resetUploadUI();
-            };
+            }
+        });
 
-            xhr.send(file);
-
-        } catch (err) {
-            console.error(err);
-            alert(`Stream Error: ${err.message}`);
-            resetUploadUI();
-        }
+        // Fire the upload session
+        upload.start();
     });
 
     async function fetchVideos() {
